@@ -30,6 +30,8 @@ import com.google.common.collect.Sets;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
@@ -43,6 +45,8 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.Manifest;
 import java.util.logging.Logger;
+import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
 
 /**
  * Scans the source of a {@link ClassLoader} and finds all loadable classes and resources.
@@ -264,14 +268,39 @@ public final class ClassPath {
         new ImmutableSortedSet.Builder<ResourceInfo>(Ordering.usingToString());
     private final Set<URI> scannedUris = Sets.newHashSet();
     private final Set<String> scannedDirectories = Sets.newHashSet();
+    private final Map<String, JarFile> springBootJars = Maps.newHashMap();
+    private static boolean springJarFileAvailable;
+    private static Constructor<?> springJarConstructor;
+    private static Method getJarEntryMethod;
+    private static Method getNestedJarFileMethod;
+    private static Method getUrlMethod;
+
+    private static final String SPRING_BOOT_JARFILE_CLASSNAME = "org.springframework.boot.loader.jar.JarFile";
+    private static final Pattern NESTED_JARFILE_PATTERN = Pattern.compile("(?<=/BOOT-INF/lib/).*.jar");
+
+    static {
+      try {
+        Class<?> springBootJarFileClass = Scanner.class.getClassLoader().loadClass(SPRING_BOOT_JARFILE_CLASSNAME);
+        springJarConstructor = springBootJarFileClass.getConstructor(File.class);
+        getJarEntryMethod = springBootJarFileClass.getMethod("getJarEntry", CharSequence.class);
+        getNestedJarFileMethod = springBootJarFileClass.getMethod("getNestedJarFile", ZipEntry.class);
+        getUrlMethod = springBootJarFileClass.getMethod("getUrl");
+        springJarFileAvailable = true;
+      } catch (Exception e) {
+        springJarFileAvailable = false;
+      }
+    }
 
     ImmutableSortedSet<ResourceInfo> getResources() {
       return resources.build();
     }
 
     void scan(URI uri, ClassLoader classloader) throws IOException {
-      if (uri.getScheme().equals("file") && scannedUris.add(uri)) {
+      String uriScheme = uri.getScheme();
+      if (uriScheme.equals("file") && scannedUris.add(uri)) {
         scanFrom(new File(uri), classloader);
+      } else if (uriScheme.equals("jar") && scannedUris.add(uri)) {
+        scanFromSpringBootJar(uri, classloader);
       }
     }
   
@@ -332,8 +361,41 @@ public final class ClassPath {
         // Not a jar file
         return;
       }
+      scanJar(jarFile, classloader);
+    }
+
+    private void scanFromSpringBootJar(URI uri, final ClassLoader classloader) throws IOException {
+      if (!(uri.toString().contains("/BOOT-INF/") && springJarFileAvailable)) {
+        return;
+      }
+      // uri follows the pattern: jar:file:/path/to/file/spring-boot-app.jar!/BOOT-INF/lib/dependency.jar!/
+      String[] parts = uri.toString().split("!", 3);
+      String rootJarName = parts[0].substring(9); // Removes leading "jar:file:"
+      String nestedJarName = parts[1].substring(1); // Removes leading "/"
+      JarFile jarFile = getNestedJar(rootJarName, nestedJarName);
+      if (jarFile != null) {
+        scanJar(jarFile, classloader);
+      }
+    }
+
+    private JarFile getNestedJar(String rootJarName, String nestedJarName) {
+        try {
+          JarFile springBootJar = springBootJars.get(rootJarName);
+          if (springBootJar == null) {
+            springBootJar = (JarFile) springJarConstructor.newInstance(new File(rootJarName));
+            springBootJars.put(rootJarName, springBootJar);
+          }
+          ZipEntry jarEntry = (ZipEntry) getJarEntryMethod.invoke(springBootJar, nestedJarName);
+          return (JarFile) getNestedJarFileMethod.invoke(springBootJar, jarEntry);
+        } catch (Exception e) {
+          // Spring Boot JarFile is not available
+          return null;
+        }
+    }
+
+    private void scanJar(JarFile jarFile, ClassLoader classloader) throws IOException {
       try {
-        for (URI uri : getClassPathFromManifest(file, jarFile.getManifest())) {
+        for (URI uri : getClassPathFromManifest(jarFile)) {
           scan(uri, classloader);
         }
         Enumeration<JarEntry> entries = jarFile.entries();
@@ -357,8 +419,8 @@ public final class ClassPath {
      * JAR File Specification</a>. If {@code manifest} is null, it means the jar file has no
      * manifest, and an empty set will be returned.
      */
-    @VisibleForTesting static ImmutableSet<URI> getClassPathFromManifest(
-        File jarFile, Manifest manifest) {
+    @VisibleForTesting static ImmutableSet<URI> getClassPathFromManifest(JarFile jarFile) throws IOException {
+      Manifest manifest = jarFile.getManifest();
       if (manifest == null) {
         return ImmutableSet.of();
       }
@@ -387,13 +449,23 @@ public final class ClassPath {
      * JAR File Specification</a>. Even though the specification only talks about relative urls,
      * absolute urls are actually supported too (for example, in Maven surefire plugin).
      */
-    @VisibleForTesting static URI getClassPathEntry(File jarFile, String path)
+    @VisibleForTesting static URI getClassPathEntry(JarFile jarFile, String path)
         throws URISyntaxException {
       URI uri = new URI(path);
       if (uri.isAbsolute()) {
         return uri;
       } else {
-        return new File(jarFile.getParentFile(), path.replace('/', File.separatorChar)).toURI();
+        if (jarFile.getClass().getName().equals(SPRING_BOOT_JARFILE_CLASSNAME)) {
+          try {
+            URL jarFileUrl = (URL) getUrlMethod.invoke(jarFile);
+            return new URI(NESTED_JARFILE_PATTERN.matcher(jarFileUrl.toString()).replaceFirst(path));
+          } catch (Exception e) {
+            throw new URISyntaxException(jarFile.getName(), e.getMessage());
+          }
+        } else {
+          File parentFile = new File(jarFile.getName()).getParentFile();
+          return new File(parentFile, path.replace('/', File.separatorChar)).toURI();
+        }
       }
     }
   }
