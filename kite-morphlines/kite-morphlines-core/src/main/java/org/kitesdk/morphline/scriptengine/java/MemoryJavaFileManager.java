@@ -38,8 +38,11 @@ import java.io.Reader;
 import java.io.StringReader;
 import java.net.URI;
 import java.nio.CharBuffer;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import javax.tools.FileObject;
 import javax.tools.ForwardingJavaFileManager;
@@ -47,20 +50,24 @@ import javax.tools.JavaFileManager;
 import javax.tools.JavaFileObject;
 import javax.tools.JavaFileObject.Kind;
 import javax.tools.SimpleJavaFileObject;
+import javax.tools.StandardLocation;
 
 /**
  * JavaFileManager that keeps compiled .class bytes in memory.
  */
 @SuppressWarnings("unchecked")
-final class MemoryJavaFileManager extends ForwardingJavaFileManager {				 
+final class MemoryJavaFileManager extends ForwardingJavaFileManager<JavaFileManager> {
 
 	/** Java source file extension. */
 	private final static String EXT = ".java";
 
-	private Map<String, byte[]> classBytes;
+  private final JavaClassesFinder finder;
+
+  private Map<String, byte[]> classBytes;
 	
 	public MemoryJavaFileManager(JavaFileManager fileManager) {
 		super(fileManager);
+    finder = new JavaClassesFinder(Thread.currentThread().getContextClassLoader());
 		classBytes = new HashMap<String, byte[]>();
 	}
 
@@ -75,7 +82,34 @@ final class MemoryJavaFileManager extends ForwardingJavaFileManager {
 	public void flush() throws IOException {
 	}
 
-	/**
+  @Override
+  public String inferBinaryName(Location location, JavaFileObject file) {
+    if (file instanceof CompiledJavaFileObject) {
+      return ((CompiledJavaFileObject) file).binaryName();
+    } else {
+      return super.inferBinaryName(location, file);
+    }
+  }
+
+  @Override
+  public Iterable<JavaFileObject> list(Location location, String packageName, Set set, boolean recurse) throws IOException {
+    List<JavaFileObject> result = new ArrayList<JavaFileObject>();
+
+    if (location == StandardLocation.PLATFORM_CLASS_PATH) {
+      // let standard manager handle
+      return super.list(location, packageName, set, recurse);
+    } else if (location == StandardLocation.CLASS_PATH && set.contains(JavaFileObject.Kind.CLASS)) {
+      Iterable<JavaFileObject> list = super.list(location, packageName, set, recurse);
+      for (JavaFileObject f : list) {
+        result.add(f);
+      }
+      // app specific classes are here
+      result.addAll(finder.listAll(packageName));
+    }
+    return result;
+  }
+
+  /**
 	 * A file object used to represent Java source coming from a string.
 	 */
 	private static class StringInputBuffer extends SimpleJavaFileObject {
